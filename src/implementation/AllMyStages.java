@@ -14,6 +14,7 @@ import voidtypes.VoidLatch;
 import baseclasses.CpuCore;
 import baseclasses.Latch;
 import cpusimulator.CpuSimulator;
+import java.util.EnumSet;
 import static utilitytypes.EnumOpcode.*;
 import utilitytypes.ICpuCore;
 import utilitytypes.IGlobals;
@@ -153,7 +154,26 @@ public class AllMyStages {
             return s;
         }
         
+        static final EnumSet<EnumOpcode> floatAddSubSet = 
+                EnumSet.of(FADD, FSUB, FCMP);
 
+        private void renameDestReg(int new_preg, Operand op, IGlobals globals) {
+            int arch_reg = op.getRegisterNumber();
+            IRegFile regfile = globals.getRegisterFile();
+            int[] rat = globals.getPropertyIntArray("rat");
+            
+            int old_preg = rat[arch_reg];
+            regfile.markRenamed(old_preg, true);
+            
+            regfile.changeFlags(new_preg, IRegFile.SET_USED | IRegFile.SET_INVALID, 
+                    IRegFile.CLEAR_FLOAT | IRegFile.CLEAR_RENAMED);
+            rat[arch_reg] = new_preg;
+            
+            Logger.out.println("Dest R" + arch_reg + ": P" + old_preg + " released, P" + new_preg + " allocated");
+            
+            op.rename(new_preg);
+        }
+        
 //        private static final String[] fwd_regs = {"ExecuteToWriteback", 
 //            "MemoryToWriteback"};
         
@@ -187,15 +207,34 @@ public class AllMyStages {
             
             EnumOpcode opcode = ins.getOpcode();
             Operand oper0 = ins.getOper0();
+            Operand src1  = ins.getSrc1();
+            Operand src2  = ins.getSrc2();
             IRegFile regfile = globals.getRegisterFile();
+            int[] rat = globals.getPropertyIntArray("rat");
             
-            // This code is to prevent having more than one of the same regster
-            // as a destiation register in the pipeline at the same time.
+            // Rename sources
+            if (opcode.oper0IsSource() && oper0.isRegister()) {
+                oper0.rename(rat[oper0.getRegisterNumber()]);
+            }
+            if (src1.isRegister()) {
+                src1.rename(rat[src1.getRegisterNumber()]);
+            }
+            if (src2.isRegister()) {
+                src2.rename(rat[src2.getRegisterNumber()]);
+            }
+            
+            // Select a new free register (but don't mark it used yet)
+            int target_phys_reg = -1;
             if (opcode.needsWriteback()) {
                 int oper0reg = oper0.getRegisterNumber();
-                if (regfile.isInvalid(oper0reg)) {
-                    //Logger.out.println("Stall because dest R" + oper0reg + " is invalid");
-                    setResourceWait("Dest:"+oper0.getRegisterName());
+                for (int p=0; p<256; p++) {
+                    if (!regfile.isUsed(p)) {
+                        target_phys_reg = p;
+                        break;
+                    }
+                }
+                if (target_phys_reg < 0) {
+                    setResourceWait("No free physical registers");
                     return;
                 }
             }
@@ -206,8 +245,6 @@ public class AllMyStages {
             // See what operands can be fetched by forwarding
             forwardingSearch(input);
             
-            Operand src1  = ins.getSrc1();
-            Operand src2  = ins.getSrc2();
             
             
             boolean take_branch = false;
@@ -359,11 +396,12 @@ public class AllMyStages {
                     
                     Operand pc_operand = Operand.newRegister(Operand.PC_REGNUM);
                     pc_operand.setIntValue(ins.getPCAddress());
+                    renameDestReg(target_phys_reg, oper0, globals);
                     ins.setSrc1(pc_operand);
                     ins.setSrc2(Operand.newLiteralSource(1));
                     ins.setLabelTarget(VoidLabelTarget.getVoidLabelTarget());
+                    
                     d2e_output.setInstruction(ins);
-                    regfile.markInvalid(oper0.getRegisterNumber());
                     
                     globals.setClockedProperty("program_counter_takenbranch", value1);
                     globals.setClockedProperty("branch_state_decode", GlobalData.BRANCH_STATE_TAKEN);
@@ -384,8 +422,24 @@ public class AllMyStages {
             // appropriate for the type of instruction being processed.
             Latch output;
             int output_num;
+            if (floatAddSubSet.contains(opcode)) {
+                output_num = lookupOutput("DecodeToFloatAddSub");
+                output = this.newOutput(output_num);
+            } else
+            if (opcode == EnumOpcode.FDIV) {
+                output_num = lookupOutput("DecodeToFloatDiv");
+                output = this.newOutput(output_num);
+            } else
+            if (opcode == EnumOpcode.FMUL) {
+                output_num = lookupOutput("DecodeToFloatMul");
+                output = this.newOutput(output_num);
+            } else
+            if (opcode == EnumOpcode.DIV || opcode == EnumOpcode.MOD) {
+                output_num = lookupOutput("DecodeToIntDiv");
+                output = this.newOutput(output_num);
+            } else
             if (opcode == EnumOpcode.MUL) {
-                output_num = lookupOutput("DecodeToMSFU");
+                output_num = lookupOutput("DecodeToIntMul");
                 output = this.newOutput(output_num);
             } else
             if (opcode.accessesMemory()) {
@@ -450,8 +504,7 @@ public class AllMyStages {
             
             // Mark the destination register invalid
             if (opcode.needsWriteback()) {
-                int oper0reg = oper0.getRegisterNumber();
-                regfile.markInvalid(oper0reg);
+                renameDestReg(target_phys_reg, oper0, globals);
             }            
             
             // Copy the forward# properties
@@ -488,57 +541,6 @@ public class AllMyStages {
             boolean isfloat = ins.getSrc1().isFloat() || ins.getSrc2().isFloat();
             output.setResultValue(result, isfloat);
             output.setInstruction(ins);
-        }
-    }
-    
-
-    /*** Memory Stage ***/
-    static class Memory extends PipelineStageBase {
-        public Memory(ICpuCore core) {
-            super(core, "Memory");
-        }
-
-        @Override
-        public void compute(Latch input, Latch output) {
-            if (input.isNull()) return;
-            doPostedForwarding(input);
-            InstructionBase ins = input.getInstruction();
-            setActivity(ins.toString());
-
-            Operand oper0 = ins.getOper0();
-            int oper0val = ins.getOper0().getValue();
-            int source1 = ins.getSrc1().getValue();
-            int source2 = ins.getSrc2().getValue();
-            
-            // The Memory stage no longer follows Execute.  It is an independent
-            // functional unit parallel to Execute.  Therefore we must perform
-            // address calculation here.
-            int addr = source1 + source2;
-            
-            int value = 0;
-            IGlobals globals = (GlobalData)getCore().getGlobals();
-            int[] memory = globals.getPropertyIntArray(MAIN_MEMORY);
-
-            switch (ins.getOpcode()) {
-                case LOAD:
-                    // Fetch the value from main memory at the address
-                    // retrieved above.
-                    value = memory[addr];
-                    output.setResultValue(value);
-                    output.setInstruction(ins);
-                    addStatusWord("Mem[" + addr + "]");
-                    break;
-                
-                case STORE:
-                    // For store, the value to be stored in main memory is
-                    // in oper0, which was fetched in Decode.
-                    memory[addr] = oper0val;
-                    addStatusWord("Mem[" + addr + "]=" + ins.getOper0().getValueAsString());
-                    return;
-                    
-                default:
-                    throw new RuntimeException("Non-memory instruction got into Memory stage");
-            }
         }
     }
     

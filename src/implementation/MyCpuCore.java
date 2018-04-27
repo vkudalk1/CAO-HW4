@@ -10,9 +10,11 @@ import baseclasses.PipelineStageBase;
 import baseclasses.CpuCore;
 import examples.MultiStageFunctionalUnit;
 import tools.InstructionSequence;
+import utilitytypes.IGlobals;
 import utilitytypes.IPipeReg;
 import utilitytypes.IPipeStage;
 import static utilitytypes.IProperties.*;
+import utilitytypes.IRegFile;
 import utilitytypes.Logger;
 import voidtypes.VoidRegister;
 
@@ -27,28 +29,62 @@ public class MyCpuCore extends CpuCore {
         
     public void initProperties() {
         properties = new GlobalData();
+        IRegFile rf = ((IGlobals)properties).getRegisterFile();
+        int[] rat = ((IGlobals)properties).getPropertyIntArray("rat");
+        for (int r=0; r<32; r++) {
+            rf.changeFlags(r, IRegFile.SET_USED, 0);
+            rat[r] = r;
+        }
     }
     
     public void loadProgram(InstructionSequence program) {
         getGlobals().loadProgram(program);
     }
     
+    private void freePhysRegs() {
+        IGlobals globals = getGlobals();
+        IRegFile regfile = globals.getRegisterFile();
+        boolean printed = false;
+        for (int i=0; i<256; i++) {
+            if (regfile.isUsed(i)) {
+                if (!regfile.isInvalid(i) && regfile.isRenamed(i)) {
+                    regfile.markUsed(i, false);
+                    if (!printed) {
+                        Logger.out.print("# Freeing:");
+                        printed = true;
+                    }
+                    Logger.out.print(" P" + i);
+                }
+            }
+        }
+        if (printed) Logger.out.println();
+    }
+    
     public void runProgram() {
         properties.setProperty("running", true);
         while (properties.getPropertyBoolean("running")) {
             Logger.out.println("## Cycle number: " + cycle_number);
+            freePhysRegs();
             advanceClock();
         }
     }
 
     @Override
     public void createPipelineRegisters() {
+        // To individual stages
         createPipeReg("FetchToDecode");
         createPipeReg("DecodeToExecute");
         createPipeReg("DecodeToMemory");
-        createPipeReg("DecodeToMSFU");
+        createPipeReg("DecodeToIntDiv");
+        createPipeReg("DecodeToFloatDiv");
+        // To functional units
+        createPipeReg("DecodeToIntMul");
+        createPipeReg("DecodeToFloatAddSub");
+        createPipeReg("DecodeToFloatMul");
+        // From individual stages to writeback
+        createPipeReg("IDivToWriteback");
+        createPipeReg("FDivToWriteback");
         createPipeReg("ExecuteToWriteback");
-        createPipeReg("MemoryToWriteback");
     }
 
     @Override
@@ -56,56 +92,60 @@ public class MyCpuCore extends CpuCore {
         addPipeStage(new AllMyStages.Fetch(this));
         addPipeStage(new AllMyStages.Decode(this));
         addPipeStage(new AllMyStages.Execute(this));
-        addPipeStage(new AllMyStages.Memory(this));
+        addPipeStage(new IntDiv(this));
+        addPipeStage(new FloatDiv(this));
         addPipeStage(new AllMyStages.Writeback(this));
     }
 
     @Override
     public void createChildModules() {
-        // MSFU is an example multistage functional unit.  Use this as a
-        // basis for FMul, IMul, and FAddSub functional units.
-        addChildUnit(new MultiStageFunctionalUnit(this, "MSFU"));
+        addChildUnit(new MemUnit(this));
+        addChildUnit(new IntMul(this));
+        addChildUnit(new FloatMul(this));
+        addChildUnit(new FloatAddSub(this));
     }
 
     @Override
     public void createConnections() {
         // Connect pipeline elements by name.  Notice that 
-        // Decode has multiple outputs, able to send to Memory, Execute,
-        // or any other compute stages or functional units.
-        // Writeback also has multiple inputs, able to receive from 
-        // any of the compute units.
-        // NOTE: Memory no longer connects to Execute.  It is now a fully 
+        // Decode has two outputs, anle to send to either Memory OR Execute 
+        // and that Writeback has two inputs, able to receive from both
+        // Execute and Memory.  
+        // Memory no longer connects to Execute.  It is now a fully 
         // independent functional unit, parallel to Execute.
-        
-        // Connect two stages through a pipelin register
         connect("Fetch", "FetchToDecode", "Decode");
+                
+        // To individual stages
+        connect("Decode", "DecodeToExecute", "Execute");          // Stage
+        connect("Decode", "DecodeToMemory", "MemUnit");           // Stage
+        connect("Decode", "DecodeToIntDiv", "IntDiv");            // Stage
+        connect("Decode", "DecodeToFloatDiv", "FloatDiv");        // Stage
+        // To functional units
+        connect("Decode", "DecodeToIntMul", "IntMul");            // Unit
+        connect("Decode", "DecodeToFloatAddSub", "FloatAddSub");  // Unit
+        connect("Decode", "DecodeToFloatMul", "FloatMul");        // Unit
         
-        // Decode has multiple output registers, connecting to different
-        // execute units.  
-        // "MSFU" is an example multistage functional unit.  Those that
-        // follow the convention of having a single input stage and single
-        // output register can be connected simply my naming the functional
-        // unit.  The input to MSFU is really called "MSFU.in".
-        connect("Decode", "DecodeToExecute", "Execute");
-        connect("Decode", "DecodeToMemory", "Memory");
-        connect("Decode", "DecodeToMSFU", "MSFU");
-        
-        // Writeback has multiple input connections from different execute
-        // units.  The output from MSFU is really called "MSFU.Delay.out",
-        // which was aliased to "MSFU.out" so that it would be automatically
-        // identified as an output from MSFU.
-        connect("Execute","ExecuteToWriteback", "Writeback");
-        connect("Memory", "MemoryToWriteback", "Writeback");
-        connect("MSFU", "Writeback");
+        // From stages
+        connect("Execute", "ExecuteToWriteback", "Writeback");
+        connect("IntDiv", "IDivToWriteback", "Writeback");
+        connect("FloatDiv", "FDivToWriteback", "Writeback");
+        // From functional units
+        connect("IntMul", "Writeback");
+        connect("FloatMul", "Writeback");
+        connect("FloatAddSub", "Writeback");
+        connect("MemUnit", "Writeback");
     }
 
     @Override
     public void specifyForwardingSources() {
         addForwardingSource("ExecuteToWriteback");
-        addForwardingSource("MemoryToWriteback");
-        
-        // MSFU.specifyForwardingSources is where this forwarding source is added
-        // addForwardingSource("MSFU.out");
+        addForwardingSource("FDivToWriteback");
+        addForwardingSource("IDivToWriteback");
+        // Forwarding sources for submodules are specified in the
+        // specifyForwardingSources method of each module.
+//        addForwardingSource("IntMul.out");    // TODO:  Find the output automatically
+//        addForwardingSource("FloatMul.out");
+//        addForwardingSource("FloatAddSub.out");
     }
 
     @Override

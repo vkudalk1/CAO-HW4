@@ -45,8 +45,10 @@ public class GlobalData extends PropertiesContainer implements IGlobals {
         this.setProperty("branch_state_fetch", BRANCH_STATE_NULL);
         this.setProperty("branch_state_decode", BRANCH_STATE_NULL);
         
-        IRegFile regfile = new RegisterFile(32);
-	this.setProperty("reg_file", regfile);
+        IRegFile regfile = new RegisterFile(256);
+        regfile.markPhysical();
+        this.setProperty("reg_file", regfile);
+        this.setProperty("rat", new int[32]);
     }
 
     /**
